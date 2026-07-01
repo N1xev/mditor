@@ -1,0 +1,252 @@
+// The Tokenizer has two main functions: Peek() and Eat(). Peek()
+// returns the current token(Of the tokenizer). Each token is a
+// (atomic) string which is a single digit(NUM) / letter(VARLIT) /
+// symbol(SYM) or a latex command, (e.g. \int) and latex commands
+// are seperated into commands formed by a word, CMDSTR, or a
+// command formed by a single symbol(e.g. \{), CMDSYM.
+package latex
+
+import (
+	re "regexp"
+	"strconv"
+	"strings"
+)
+
+type Pos int
+
+// Token is the set of lexical tokens
+type Token int
+
+const (
+	// Special tokens
+	ILLEGAL Token = iota
+	EOF
+	NOTOKEN     // for Parser.expect, representing 'not expecting anything'
+	SINGLETOKEN // for Parser.expect, 'expecting single characters'
+	COMMENT
+
+	literal_beg
+	// basic type literals
+	NUM    // numbers
+	VARLIT // variable string literal, contains only alphabets
+	SYM    // symbols: non-alphabet characters that have no special grammar
+	literal_end
+
+	operator_beg
+	LPAREN // (
+	LBRACK // [
+	LBRACE // {
+	RPAREN // )
+	RBRACK // ]
+	RBRACE // }
+
+	CARET      // ^
+	UNDERSCORE // _
+	AMPERSAND  // &
+	NEWLINE    // \\ for row breaks in environments
+	operator_end
+
+	command_beg
+	CMDSTR
+	CMDSYM
+	command_end
+)
+
+var tokens = [...]string{
+	ILLEGAL: "ILLEGAL",
+	EOF:     "EOF",
+	COMMENT: "COMMENT",
+
+	NUM:    "NUM",
+	VARLIT: "VARLIT",
+	SYM:    "SYM",
+
+	LPAREN: "(",
+	LBRACK: "[",
+	LBRACE: "{",
+	RPAREN: ")",
+	RBRACK: "]",
+	RBRACE: "}",
+
+	CARET:      "^",
+	UNDERSCORE: "_",
+	AMPERSAND:  "&",
+	NEWLINE:    "\\\\",
+
+	CMDSTR: "CMDSTR", // control sequence `\text`, `\frac`, `\pi` etc.
+	CMDSYM: "CMDSYM", // control symbols, `\^`, `\\` etc.
+}
+
+type tokenizer interface {
+	Peek() Token
+	Eat() Token
+	IsEOF() bool
+}
+
+type Tokenizer struct {
+	Cursor Pos
+	Stream string
+
+	curr string
+	tok  Token
+
+	strCmdRegex *re.Regexp // for matching commands that consist of alphabets
+	symCmdRegex *re.Regexp // for matching commands that consist of symbols e.g. "\;"
+	numRegex    *re.Regexp
+	alpRegex    *re.Regexp
+	spaceRegex  *re.Regexp // used to remove whitespaces
+}
+
+func (tok Token) String() string {
+	s := ""
+	if 0 <= tok && tok < Token(len(tokens)) {
+		s = tokens[tok]
+	}
+
+	if s == "" {
+		s = "token(" + strconv.Itoa(int(tok)) + ")"
+	}
+
+	return s
+}
+
+// Predicates
+
+// IsLiteral returns true for tokens corresponding to identifiers
+// and basic type literals; it returns false otherwise.
+func (tok Token) IsLiteral() bool { return literal_beg < tok && tok < literal_end }
+
+// IsOperator returns true for tokens corresponding to operators and
+// delimiters; it returns false otherwise.
+func (tok Token) IsOperator() bool { return operator_beg < tok && tok < operator_end }
+
+func (t *Tokenizer) Init(stream string) {
+	t.Stream = stream
+	t.Cursor = Pos(0)
+
+	t.strCmdRegex = re.MustCompile(`^\\[a-zA-Z]+`)
+	t.symCmdRegex = re.MustCompile(`^\\[^a-zA-Z0-9]`)
+	t.numRegex = re.MustCompile("^[0-9]")
+	t.alpRegex = re.MustCompile("^[a-zA-Z]")
+	t.spaceRegex = re.MustCompile(`^\s+`)
+
+	t.Eat()
+}
+
+func (t *Tokenizer) Peek() Token { return t.tok }
+
+// Current returns the literal text of the most recently emitted token.
+// Useful when a consumer has observed EOF and still needs the trailing token's
+// text without reaching into unexported fields.
+func (t *Tokenizer) Current() string { return t.curr }
+
+func (t *Tokenizer) Eat() string {
+	t.consumeWhitespaces()
+	t.consumeComments()
+	if t.IsEOF() {
+		return t.curr
+	}
+	// don't move cursor anymore, just spit out the remaining token
+	// fmt.Printf("stream '\x1b[31m%s\x1b[0m%s'\n", t.curr, t.Stream[t.Cursor:])
+	if int(t.Cursor) >= len(t.Stream) {
+		// fmt.Printf("last token '\x1b[31m%s\x1b[0m%s'\n", t.curr, t.Stream[t.Cursor:])
+		curr := t.curr
+		t.tok = EOF
+		t.curr = ""
+		return curr
+	}
+	stream := t.Stream[t.Cursor:]
+	curr := t.curr
+	tok := SYM  // ensure a new token is assigned each call
+	length := 1 // default value to catch-all
+
+	defer func() {
+		t.curr = stream[0:length]
+		t.tok = tok
+		t.Cursor = Pos(int(t.Cursor) + length)
+		//fmt.Printf("stream '\x1b[31m%s\x1b[0m%s'\n", t.curr, stream[length:])
+	}()
+
+	if strings.HasPrefix(stream, `\\`) {
+		length = 2
+		tok = NEWLINE
+		return curr
+	}
+
+	if temp := t.strCmdRegex.FindStringIndex(stream); temp != nil {
+		length = temp[1]
+		tok = CMDSTR
+		return curr
+	}
+	if temp := t.symCmdRegex.FindStringIndex(stream); temp != nil {
+		length = temp[1]
+		tok = CMDSYM
+		return curr
+	}
+	if temp := t.numRegex.FindStringIndex(stream); temp != nil {
+		length = temp[1]
+		tok = NUM
+		return curr
+	}
+	if temp := t.alpRegex.FindStringIndex(stream); temp != nil {
+		length = temp[1]
+		tok = VARLIT
+		return curr
+	}
+	// match single character tokens
+	switch stream[0:1] { // stream[0] is a byte, stream[0:1] is a slice
+	case "{":
+		tok = LBRACE
+		return curr
+	case "}":
+		tok = RBRACE
+		return curr
+	case "^":
+		tok = CARET
+		return curr
+	case "_":
+		tok = UNDERSCORE
+		return curr
+	case "&":
+		tok = AMPERSAND
+		return curr
+	case "%":
+		tok = COMMENT
+		return curr
+	}
+
+	return curr
+}
+
+// skips to the delimiter and return the skipped string
+func (t *Tokenizer) SkipToDelimiter(delimiter string) string {
+	stream := t.curr + t.Stream[t.Cursor:]
+	i := Pos(strings.Index(stream, delimiter))
+	if i == -1 {
+		panic("Tokenizer.SkipToDelimiter could not find '" + delimiter + "'")
+	}
+	t.Cursor += Pos(i)
+	t.Eat()
+
+	return stream[:i]
+}
+
+func (t *Tokenizer) IsEOF() bool { return t.tok == EOF }
+func (t *Tokenizer) consumeWhitespaces() {
+	stream := t.Stream[t.Cursor:]
+	if loc := t.spaceRegex.FindStringIndex(stream); loc != nil {
+		t.Cursor = Pos(int(t.Cursor) + loc[1])
+	}
+}
+
+func (t *Tokenizer) consumeComments() {
+	stream := t.Stream[t.Cursor:]
+	if len(stream) == 0 || stream[0] != '%' {
+		return
+	}
+	if nl := strings.IndexByte(stream, '\n'); nl >= 0 {
+		t.Cursor += Pos(nl)
+	} else {
+		t.Cursor = Pos(len(t.Stream))
+	}
+}

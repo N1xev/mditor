@@ -1,0 +1,72 @@
+package renderer
+
+import (
+	parser "github.com/N1xev/mditor/internal/latex"
+)
+
+type Renderer struct {
+	Color        bool
+	Buffer       string
+	LatexTree    parser.FlexContainer
+	FocusOn      parser.Container // the container in which the cursor is, a better implementation would be letting Render functions return a 'focused' flag when cursor is found
+	HasSelection bool             // whether there is a selection in FocusOn
+	Focus        bool             // whether the widget itself is focused
+}
+
+func New(color bool) Renderer {
+	root := &parser.UnboundCompExpr{}
+	return Renderer{
+		Color:        color,
+		Buffer:       "",
+		LatexTree:    root,
+		FocusOn:      root,
+		HasSelection: false,
+		Focus:        false,
+	}
+}
+
+func FromFormula(formula string, color bool) *Renderer {
+	root := parser.Parse(formula)
+	r := &Renderer{
+		Color:        color,
+		Buffer:       "",
+		LatexTree:    root,
+		FocusOn:      root,
+		HasSelection: false,
+		Focus:        false,
+	}
+	r.Sync(nil, false)
+	return r
+}
+
+func (r *Renderer) Load(tree parser.FlexContainer) {
+	r.LatexTree = tree
+	r.Sync(nil, false)
+}
+
+// rerender the latex tree
+func (r *Renderer) Sync(focus parser.Container, selected bool /*whether there is a selection*/) {
+	r.FocusOn = focus
+	r.HasSelection = selected
+	r.DrawToBuffer(r.LatexTree)
+}
+
+func (r *Renderer) View() string {
+	return r.Buffer
+}
+
+func min(numbers ...int) int {
+	if len(numbers) == 0 {
+		panic("min was passed 0 parameters")
+	} else if len(numbers) == 1 {
+		return numbers[0]
+	}
+
+	m := numbers[0]
+	for _, n := range numbers {
+		if n < m {
+			m = n
+		}
+	}
+	return m
+}

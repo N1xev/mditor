@@ -1,0 +1,376 @@
+package latex
+
+import (
+	"fmt"
+
+	"github.com/charmbracelet/x/ansi"
+)
+
+type Parser struct {
+	eh        ErrorHandler
+	tokenizer Tokenizer
+	// Next token
+	pos       Pos         // token position
+	tok       Token       // one token look-ahead
+	lit       string      // token literal
+	expecting []string    // open delimiters awaiting close (top of slice is innermost)
+
+	// Non-syntactic parser control
+	exprLev  int // depth in tree of current position
+	treeRoot *UnboundCompExpr
+}
+
+func Parse(src string) *UnboundCompExpr {
+	return NewParser(src).GetTree()
+}
+
+// NewParser is the public entry point used by the renderer to build a parse
+// tree from LaTeX source. Exported because the renderer lives in a separate
+// package and can't reach an unexported constructor.
+func NewParser(src string) *Parser {
+	p := &Parser{}
+	p.tokenizer.Init(src)
+	p.next()
+	p.treeRoot = p.parseTopLevel()
+	return p
+}
+
+func (p *Parser) GetTree() *UnboundCompExpr { return p.treeRoot }
+
+func (p *Parser) next() {
+	p.tok = p.tokenizer.Peek()
+	if !p.tokenizer.IsEOF() {
+		p.lit = p.tokenizer.Eat()
+	} else {
+		p.lit = p.tokenizer.Current()
+	}
+}
+
+// Note that the parser's EOF is separate from the tokenizer's.
+// the Parser's EOF should arrive one iteration of Parser.next()
+// later than the tokenizer
+func (p *Parser) IsEOF() bool { return p.tok == EOF }
+
+// Expect a closing expression, when such an expression is encountered,
+// The parser will attempt to close off the matching expression
+func (p *Parser) expect(lit string) {
+	p.expecting = append(p.expecting, lit)
+}
+
+func (p *Parser) dropExpect(lit string) {
+	if p.expecting[len(p.expecting)-1] != lit {
+		p.eh.AddErr(ERR_MISSING_CLOSE, "Expected '"+p.expecting[len(p.expecting)-1]+
+			"', got '"+lit+"' instead")
+	} else {
+		p.expecting = p.expecting[0 : len(p.expecting)-1]
+	}
+}
+
+func (p *Parser) matchExpectation(lit string) bool {
+	if p.exprLev <= 0 {
+		return false
+	}
+	for i := len(p.expecting); i > 0; i-- {
+		if p.expecting[i] == lit {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *Parser) parseTopLevel() *UnboundCompExpr {
+	tree := new(UnboundCompExpr)
+	for !p.IsEOF() {
+		tree.AppendChildren(p.parseGenericOnce())
+	}
+	// println(tree.VisualizeTree())
+	return tree
+}
+
+// parse one token
+func (p *Parser) parseGenericOnce() Expr {
+	switch p.tok {
+	case CMDSTR:
+		return p.parseStringCmd()
+	case CMDSYM:
+		leaf := &SimpleCmdLit{Source: p.lit, Type: CMD_UNKNOWN}
+		p.next()
+		return leaf
+	case NUM:
+		return p.parseNumLit()
+	case VARLIT:
+		return p.parseVarLit()
+	case SYM:
+		return p.parseSimpleOpLit()
+	case LBRACE:
+		return p.parseCompositeExpr()
+	case CARET:
+		return p.parseCmd1Arg(CMD_superscript)
+	case UNDERSCORE:
+		return p.parseCmd1Arg(CMD_subscript)
+	case RBRACE:
+		if p.matchExpectation(p.lit) {
+			return &EmptyExpr{}
+		}
+		// RBRACE outside any expected delimiter signals an unclosed brace pair
+		// (e.g. a stray `\left` without a matching `\right`). Record the
+		// position so the renderer can produce a useful diagnostic instead of
+		// silently swallowing the token.
+		p.eh.AddErr(ERR_UNMATCHED_CLOSE, fmt.Sprintf("before cursor %d, at token %s of type %s",
+			p.tokenizer.Cursor, p.lit, p.tok.String()))
+	}
+	// println("BadExpr!")
+	p.next()
+	return &BadExpr{}
+}
+
+func (p *Parser) parseStringCmd() Expr {
+	kind := MatchLatexCmd(p.lit)
+
+	var leaf Expr
+
+	switch {
+	case p.lit == "\\begin":
+		leaf = p.parseEnvExpr()
+	case kind.TakesRawStrArg():
+		leaf = p.parseTextCommand(kind)
+	case kind.IsVanillaSym():
+		leaf = &(SimpleCmdLit{Source: p.lit, Type: kind})
+		p.next()
+	case kind.TakesOneArg():
+		leaf = p.parseCmd1Arg(kind)
+	case kind.TakesTwoArg():
+		leaf = p.parseCmd2Arg(kind)
+	case kind.IsEnclosing():
+		leaf = p.parseCmdEnclosing()
+	case kind == CMD_UNKNOWN:
+		leaf = &(UnknownCmdLit{Source: p.lit})
+		p.next()
+	default:
+		// this shouldn't be triggered
+		leaf = &(BadExpr{})
+		p.next()
+	}
+
+	// Next() is intentionally not called here: each branch above consumes its own
+	// trailing tokens before returning, so calling it again would skip the
+	// following token.
+	return leaf
+}
+
+func (p *Parser) parseNumLit() Expr {
+	leaf := NumberLit{
+		Source: p.lit,
+	}
+	p.next()
+	return &leaf
+}
+
+func (p *Parser) parseVarLit() Expr {
+	leaf := VarLit{
+		Source: p.lit,
+	}
+	p.next()
+	return &leaf
+}
+
+func (p *Parser) parseSimpleOpLit() Expr {
+	leaf := SimpleOpLit{
+		Source: p.lit,
+	}
+	p.next()
+	return &leaf
+}
+
+func (p *Parser) parseCompositeExpr() Expr {
+	p.exprLev++
+	p.expect("}")
+	p.next() // skip "{"
+	node := new(CompositeExpr)
+	for !p.IsEOF() && p.tok != RBRACE {
+		node.AppendChildren(p.parseGenericOnce())
+		// println("add child to node; depth: ", p.exprLev)
+	}
+	if p.IsEOF() {
+		// Unclosed `{` — record the position and let the parser return a
+		// partial node instead of crashing the renderer.
+		p.eh.AddErr(ERR_UNMATCHED_CLOSE, fmt.Sprintf("expecting '}' got EOF before cursor %d", p.tokenizer.Cursor))
+		p.exprLev--
+		return node
+	}
+	p.next() // skip "}"
+	p.dropExpect("}")
+	p.exprLev--
+	return node
+}
+
+func (p *Parser) parseTextCommand(kind LatexCmd) Expr {
+	p.exprLev++
+	p.next() // skip command
+	node := &TextContainer{Text: &TextStringWrapper{}, Type: kind}
+	if p.tok != LBRACE {
+		runes := make([]Expr, 1)
+		runes[0] = RawRuneLit(p.lit[0])
+		node.Text = &TextStringWrapper{Runes: runes}
+		p.next()
+		return node
+	}
+
+	text := p.tokenizer.SkipToDelimiter("}")
+	runeLiterals := make([]Expr, ansi.StringWidth(text))
+	for i, r := range text {
+		runeLiterals[i] = RawRuneLit(r)
+	}
+	node.Text.Runes = runeLiterals
+
+	p.next() // skip }
+	p.exprLev--
+	return node
+}
+
+// Wrap with [CompositeExpr] if not already one
+func maybeWrapWithCompositeExpr(e Expr) *CompositeExpr {
+	if c, ok := e.(*CompositeExpr); ok {
+		return c
+	} else {
+		return &CompositeExpr{Elts: []Expr{e}}
+	}
+}
+
+// parse a Command that takes one arguement
+func (p *Parser) parseCmd1Arg(kind LatexCmd) Expr {
+	p.exprLev++
+	p.next() // skip command
+	node := &Cmd1ArgExpr{Type: kind}
+	node.Arg1 = maybeWrapWithCompositeExpr(p.parseGenericOnce())
+
+	p.exprLev--
+	return node
+}
+
+// parse a Command that takes two arguement
+func (p *Parser) parseCmd2Arg(kind LatexCmd) Expr {
+	p.exprLev++
+	p.next() // skip "\command"
+	node := &Cmd2ArgExpr{Type: kind}
+	node.Arg1 = maybeWrapWithCompositeExpr(p.parseGenericOnce())
+	node.Arg2 = maybeWrapWithCompositeExpr(p.parseGenericOnce())
+
+	p.exprLev--
+	return node
+}
+
+func (p *Parser) parseCmdEnclosing() Expr {
+	p.exprLev++
+	p.expect("\\right")
+	p.next() // skip "\left"
+	node := new(ParenCompExpr)
+	switch p.lit {
+	case "(", "[", "\\{":
+	default:
+		panic("\\left expected '(', '[' or '\\{' but got " + p.lit)
+	}
+	node.Left = p.lit
+	p.next() // skip left parenthesis e.g. "("
+	for !p.IsEOF() && p.lit != "\\right" {
+		node.AppendChildren(p.parseGenericOnce())
+	}
+	if p.IsEOF() {
+		// Unclosed `\left` — record the error and return the partial node
+		// so the renderer can degrade gracefully.
+		p.eh.AddErr(ERR_UNMATCHED_CLOSE, fmt.Sprintf("expecting `\\right` got EOF before cursor %d", p.tokenizer.Cursor))
+		p.exprLev--
+		return node
+	}
+	p.next() // skip "\right"
+	switch {
+	case node.Left == "(" && p.lit != ")":
+		panic("\\right expected ')' but got " + p.lit)
+	case node.Left == "[" && p.lit != "]":
+		panic("\\right expected ']' but got " + p.lit)
+	case node.Left == "\\{" && p.lit != "\\}":
+		panic("\\right expected '\\}' but got " + p.lit)
+	}
+	node.Right = p.lit
+	p.next()
+	p.dropExpect("\\right")
+	p.exprLev--
+	return node
+}
+
+func (p *Parser) parseEnvExpr() Expr {
+	from := p.tokenizer.Cursor
+	p.exprLev++
+	p.next() // skip "\begin"
+
+	if p.tok != LBRACE {
+		p.eh.AddErr(ERR_MISSING_OPEN, fmt.Sprintf("expected '{' after \\begin, got %s", p.tok.String()))
+		p.exprLev--
+		return &BadExpr{}
+	}
+
+	envNameStr := p.tokenizer.SkipToDelimiter("}")
+	envName := GetEnvName(envNameStr)
+	p.next() // skip "}"
+
+	node := &EnvExpr{Name: envName, From: from}
+
+	table := [][]*UnboundCompExpr{}
+	row := []*UnboundCompExpr{}
+	cell := &UnboundCompExpr{From: p.pos, Elts: []Expr{}}
+
+loop:
+	for {
+		switch p.tok {
+		case AMPERSAND:
+			cell.To = p.pos
+			row = append(row, cell)
+			p.next()
+			cell = &UnboundCompExpr{From: p.pos, Elts: []Expr{}}
+			continue
+		case NEWLINE:
+			cell.To = p.pos
+			row = append(row, cell)
+			table = append(table, row)
+			row = []*UnboundCompExpr{}
+			p.next()
+			cell = &UnboundCompExpr{From: p.pos, Elts: []Expr{}}
+			continue
+		case CMDSTR:
+			if p.lit == `\end` {
+				cell.To = p.pos
+				row = append(row, cell)
+				table = append(table, row)
+				break loop
+			}
+		case EOF:
+			p.eh.AddErr(ERR_MISSING_CLOSE,
+				fmt.Sprintf(`expecting \end{%s}, got EOF`, envNameStr))
+			node.To = p.pos
+			node.Elts = table
+		}
+
+		cell.AppendChildren(p.parseGenericOnce())
+	}
+
+	if p.tok == CMDSTR && p.lit == `\end` {
+		p.next() // skip "\end"
+		// consume \end{name}
+		if p.tok == LBRACE {
+			p.next() // skip "{"
+			for !p.IsEOF() && p.tok != RBRACE {
+				p.next()
+			}
+			if p.tok == RBRACE {
+				p.next() // skip "}"
+			}
+		}
+	} else {
+	}
+
+	node.To = p.tokenizer.Cursor
+	node.Elts = table
+
+	p.exprLev--
+	return node
+}
