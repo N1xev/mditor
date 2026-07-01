@@ -6,7 +6,7 @@ MDitor is a terminal based markdown editor written in [Go](https://go.dev) using
 # Installation
 
 ```sh
- go install github.com/N1xev/mditor@latest
+ go install github.com/N1xev/mditor/cmd/mditor@latest
 ```
 
 ## Features
